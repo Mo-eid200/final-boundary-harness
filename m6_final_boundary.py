@@ -30,6 +30,17 @@ Outputs
 Exit code 0 iff the fenced executor passes every case AND the naive control
 fails every case it is supposed to fail.
 
+Changelog
+    v1.2  The resource is the single enforcement point: it also consumes the
+          nonce and checks evidence validity (C9, C10: both bypassable in
+          v1.1 by calling the resource directly). Ed25519 signatures when the
+          `cryptography` package is installed, so verifiers cannot mint tokens.
+    v1.1  The resource is treated as part of the adversarial boundary:
+          revocation is pushed to the resource, and the resource verifies the
+          signature, the exact action and epoch == published fence. Adds C7
+          and C8, both reported by Krzysztof Śliwka in a review of v1.0.
+    v1.0  Initial release (C0-C6).
+
 Signatures use HMAC-SHA256 to stay dependency-free; swap sign()/verify() for
 Ed25519 (or your existing signing path) without changing anything else.
 """
@@ -50,19 +61,35 @@ from typing import Callable, Optional
 # --------------------------------------------------------------------------
 # primitives
 # --------------------------------------------------------------------------
-_KEY = secrets.token_bytes(32)
-
-
 def canon(obj) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
 
 
-def sign(payload: dict) -> str:
-    return hmac.new(_KEY, canon(payload), hashlib.sha256).hexdigest()
+try:  # asymmetric: verifiers (executor, resource) hold only the public key
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    _SK = Ed25519PrivateKey.generate()
+    _PK = _SK.public_key()
+    SIG_SCHEME = "Ed25519"
 
+    def sign(payload: dict) -> str:
+        return _SK.sign(canon(payload)).hex()
 
-def verify(payload: dict, sig: str) -> bool:
-    return hmac.compare_digest(sign(payload), sig)
+    def verify(payload: dict, sig: str) -> bool:
+        try:
+            _PK.verify(bytes.fromhex(sig), canon(payload))
+            return True
+        except (InvalidSignature, ValueError):
+            return False
+except ImportError:  # stdlib fallback: shared key, so verifiers could also mint
+    _KEY = secrets.token_bytes(32)
+    SIG_SCHEME = "HMAC-SHA256 (fallback: pip install cryptography for Ed25519)"
+
+    def sign(payload: dict) -> str:
+        return hmac.new(_KEY, canon(payload), hashlib.sha256).hexdigest()
+
+    def verify(payload: dict, sig: str) -> bool:
+        return hmac.compare_digest(sign(payload), sig)
 
 
 def action_hash(action: dict) -> str:
@@ -123,6 +150,7 @@ class Authority:
         self.clock, self.log = clock, log
         self._epoch: dict[str, int] = {}
         self._evidence: dict[str, dict] = {}
+        self.resources: list = []              # fenced resources to notify
 
     @staticmethod
     def scope(principal: str, resource: str) -> str:
@@ -168,28 +196,64 @@ class Authority:
         with self.lock:                        # blocks while an action commits
             sc = self.scope(principal, resource)
             self._epoch[sc] = self.current_epoch(sc) + 1
+            for res in self.resources:         # push the new fence
+                res.advance_fence(sc, self._epoch[sc])
             self.log.append("REVOKED", scope=sc, new_epoch=self._epoch[sc],
                             reason=reason)
             return self._epoch[sc]
 
 
 class Resource:
-    def __init__(self, log: EvidenceLog, fenced: bool) -> None:
-        self.log, self.fenced = log, fenced
+    """The resource is part of the adversarial boundary: any caller may reach
+    it directly, so a fenced resource trusts nothing it cannot verify itself.
+
+    * Revocation is PUSHED to the resource (its fence advances at revoke time),
+      so a revoked epoch is rejected even before any newer-epoch write (C7).
+    * Every request must carry a validly signed authorization for the exact
+      action, and its epoch must EQUAL the fence the authority has published.
+      A forged or unannounced higher epoch is rejected, so an attacker can
+      neither act nor lock out legitimate callers by inflating the epoch (C8).
+    * The resource is the single enforcement point: it also consumes the
+      nonce (C9) and requires the evidence to be valid now (C10), so going
+      around the executor gains an attacker nothing.
+    """
+
+    def __init__(self, log: EvidenceLog, fenced: bool,
+                 authority: Optional["Authority"] = None) -> None:
+        self.log, self.fenced, self.authority = log, fenced, authority
         self._lock = threading.Lock()
-        self._highest: dict[str, int] = {}
+        self._fence: dict[str, int] = {}
+        self._nonces: set[str] = set()
         self.applied: list[dict] = []
 
-    def apply(self, scope: str, token_epoch: int, action: dict,
-              work_s: float = 0.0) -> tuple[bool, str]:
+    def advance_fence(self, scope: str, epoch: int) -> None:
+        """Called by the authority on revocation (authenticated channel)."""
         with self._lock:
-            hi = self._highest.get(scope, 0)
-            if self.fenced and token_epoch < hi:
-                return False, f"STALE_FENCING_TOKEN({token_epoch}<{hi})"
-            self._highest[scope] = max(hi, token_epoch)
+            self._fence[scope] = max(self._fence.get(scope, 1), epoch)
+
+    def apply(self, auth: dict, action: dict,
+              work_s: float = 0.0) -> tuple[bool, str]:
+        p = auth["payload"]
+        scope, ep = p["scope"], p["epoch"]
+        with self._lock:
+            if self.fenced:
+                if not verify(p, auth["sig"]):
+                    return False, "UNAUTHENTICATED"
+                if action_hash(action) != p["action_hash"]:
+                    return False, "ACTION_MISMATCH"
+                fence = self._fence.get(scope, 1)
+                if ep < fence:
+                    return False, f"STALE_FENCING_TOKEN({ep}<{fence})"
+                if ep > fence:
+                    return False, f"UNKNOWN_EPOCH({ep}>{fence})"
+                if p["nonce"] in self._nonces:
+                    return False, "NONCE_REUSED_AT_RESOURCE"
+                self._nonces.add(p["nonce"])
+                if self.authority and not self.authority.evidence_valid_now(p["evidence_id"]):
+                    return False, "EVIDENCE_EXPIRED_AT_RESOURCE"
             if work_s:
                 time.sleep(work_s)             # the action takes real time
-            self.applied.append({"scope": scope, "epoch": token_epoch, **action})
+            self.applied.append({"scope": scope, "epoch": ep, **action})
             return True, "APPLIED"
 
 
@@ -227,7 +291,7 @@ class NaiveExecutor:
             self._nonces.add(p["nonce"])
         if between:
             between()                          # latency: decision -> boundary
-        ok, why = self.r.apply(p["scope"], p["epoch"], action, work_s)
+        ok, why = self.r.apply(auth, action, work_s)
         return self._done(p, ok, why)
 
     def _done(self, p: dict, ok: bool, why: str) -> Outcome:
@@ -262,7 +326,7 @@ class FencedExecutor(NaiveExecutor):
                 return self._done(p, False, f"EPOCH_MISMATCH(granted={p['epoch']},current={cur})")
             if not self.a.evidence_valid_now(p["evidence_id"]):
                 return self._done(p, False, "EVIDENCE_EXPIRED")
-            ok, why = self.r.apply(p["scope"], p["epoch"], action, work_s)
+            ok, why = self.r.apply(auth, action, work_s)
             return self._done(p, ok, why)
 
 
@@ -276,7 +340,8 @@ ACTION = {"resource": RES, "op": "write", "path": "/reports/q3.csv"}
 def world(executor_cls, fenced_resource: bool):
     log, clock = EvidenceLog(), Clock()
     a = Authority(clock, log)
-    r = Resource(log, fenced=fenced_resource)
+    r = Resource(log, fenced=fenced_resource, authority=a)
+    a.resources.append(r)
     a.add_evidence("ev-1", ttl_s=3600)
     return a, r, executor_cls(a, r, log), clock, log
 
@@ -351,7 +416,55 @@ def case_c6(cls, fenced):
     old = a.grant(PRINCIPAL, ACTION, "ev-1")
     a.revoke(PRINCIPAL, RES, "rotate")
     ex.execute(a.grant(PRINCIPAL, ACTION, "ev-1"), ACTION)       # epoch 2 lands
-    ok, why = r.apply(old["payload"]["scope"], old["payload"]["epoch"], ACTION)
+    ok, why = r.apply(old, ACTION)
+    return not ok, why
+
+
+def case_c7(cls, fenced):
+    """Revoked authorization reaches the resource directly BEFORE any
+    newer-epoch write (reported by K. Śliwka against v1.0)."""
+    a, r, ex, *_ = world(cls, fenced)
+    old = a.grant(PRINCIPAL, ACTION, "ev-1")
+    a.revoke(PRINCIPAL, RES, "revoked, no newer write yet")
+    ok, why = r.apply(old, ACTION)
+    return not ok, why
+
+
+def case_c8(cls, fenced):
+    """Unauthenticated higher-epoch request reaches the resource directly
+    (reported by K. Śliwka against v1.0). Two variants: an inflated epoch on
+    a stolen signature, and a payload signed with an attacker's own key."""
+    a, r, ex, *_ = world(cls, fenced)
+    stolen = a.grant(PRINCIPAL, ACTION, "ev-1")
+    forged_payload = {**stolen["payload"], "epoch": 999}
+    v1 = {"payload": forged_payload, "sig": stolen["sig"]}
+    v2 = {"payload": forged_payload,
+          "sig": hmac.new(secrets.token_bytes(32), canon(forged_payload),
+                          hashlib.sha256).hexdigest()}
+    ok1, why1 = r.apply(v1, ACTION)
+    ok2, why2 = r.apply(v2, ACTION)
+    # the legitimate caller must still be able to act afterwards
+    ok3, _ = ex.execute(a.grant(PRINCIPAL, ACTION, "ev-1"), ACTION).executed, None
+    return (not ok1) and (not ok2) and ok3, f"{why1}; {why2}; legit_after={ok3}"
+
+
+def case_c9(cls, fenced):
+    """A valid, current authorization is replayed directly at the resource,
+    bypassing the executor's nonce check."""
+    a, r, ex, *_ = world(cls, fenced)
+    auth = a.grant(PRINCIPAL, ACTION, "ev-1")
+    ok1, _ = r.apply(auth, ACTION)
+    ok2, why2 = r.apply(auth, ACTION)
+    return ok1 and not ok2, f"first={'APPLIED' if ok1 else 'REJECTED'}; second={why2}"
+
+
+def case_c10(cls, fenced):
+    """Authorization whose evidence has expired is sent directly to the
+    resource, bypassing the executor's evidence check."""
+    a, r, ex, clock, _ = world(cls, fenced)
+    auth = a.grant(PRINCIPAL, ACTION, "ev-1")
+    clock.advance(7200)
+    ok, why = r.apply(auth, ACTION)
     return not ok, why
 
 
@@ -363,6 +476,10 @@ CASES = [
     ("C4", "Authorization for action A presented for action B", case_c4, True),
     ("C5", "Replay of a consumed authorization", case_c5, False),
     ("C6", "Stale fencing token reaches the resource directly", case_c6, True),
+    ("C7", "Revoked token reaches the resource before any newer-epoch write", case_c7, True),
+    ("C8", "Unauthenticated higher-epoch request reaches the resource", case_c8, True),
+    ("C9", "Valid current token replayed directly at the resource", case_c9, True),
+    ("C10", "Expired-evidence token sent directly to the resource", case_c10, True),
 ]
 # 4th field: True if the naive control is expected to FAIL this case.
 
@@ -399,6 +516,7 @@ def main() -> int:
                      f"| {'PASS' if np_ else 'FAIL'} ({exp}): {nr} |")
     lines += ["", f"Suite valid: **{ok_all}** (fenced passes all; naive control "
               "fails exactly where expected).", "",
+              f"Signature scheme: {SIG_SCHEME}.", "",
               "Evidence logs are hash-chained; `EvidenceLog.verify_chain()` "
               "checks integrity."]
     (out / "REPORT.md").write_text("\n".join(lines) + "\n")
